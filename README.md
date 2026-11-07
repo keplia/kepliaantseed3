@@ -1,8 +1,8 @@
-# antseed-fleet (v2 — collision-proof)
+# antseed-fleet (v2 - collision-proof)
 
 Jalankan banyak instance Antseed gateway independen di satu VPS, masing-masing
 dengan domain sendiri via Cloudflare Tunnel. **Tidak pernah ada tabrakan** nama
-tunnel, port, atau hostname — termasuk dengan instance yang sudah dihapus.
+tunnel, port, atau hostname - termasuk dengan instance yang sudah dihapus.
 
 ## ? Install tercepat - satu perintah
 
@@ -16,7 +16,7 @@ Script akan menuntun 4 langkah:
 
 1. **Token Cloudflare** - ditempel, tidak ditampilkan di layar.
 2. **Domain** - semua domain (zone) di akun kamu dideteksi otomatis, tinggal pilih nomornya.
-3. **Nama** - misalnya `api` → hasilnya `api1.domainmu.com`, `api2.domainmu.com`, dst.
+3. **Nama** - misalnya `api` -> hasilnya `api1.domainmu.com`, `api2.domainmu.com`, dst.
 4. **Jumlah** - script mendeteksi spek VPS (CPU, RAM total/tersedia, disk) dan menampilkan tabel rekomendasi yang **menandai baris spek VPS kamu**, plus berapa instance yang masih bisa dibuat **saat ini**. Tinggal masukkan angka (Enter = rekomendasi).
 
 Contoh tampilan:
@@ -44,7 +44,7 @@ Contoh tampilan:
     now       free RAM         11        <- can be created right now
 ```
 
-Instance yang sudah ada ikut dihitung: nomor nama dilanjutkan otomatis (`api7`, `api8`, …) dan memori yang sedang terpakai diperhitungkan.
+Instance yang sudah ada ikut dihitung: nomor nama dilanjutkan otomatis (`api7`, `api8`, ...) dan memori yang sedang terpakai diperhitungkan.
 
 Butuh terminal interaktif (script membaca jawaban dari `/dev/tty`). Kalau tidak ada terminal sama sekali, script berhenti dengan pesan jelas dan memberi perintah yang harus dipakai - tidak pernah lanjut diam-diam tanpa token.
 
@@ -67,13 +67,13 @@ sudo bash install.sh
 | File | Fungsi |
 |---|---|
 | `install.sh` | Installer interaktif (token, pilih domain, nama, rekomendasi jumlah) |
-| `antseed-fleet` | CLI manajemen (`list`, `status`, `link`, `logs`, `remove`, `check`, …) |
+| `antseed-fleet` | CLI manajemen (`list`, `status`, `link`, `logs`, `remove`, `check`, ...) |
 | `get.sh` | Pintu masuk satu perintah `curl \| sudo bash` |
 | `README.md` | Panduan lengkap |
 
 ## Anti-tabrakan (v2)
 
-Tiga lapis proteksi, semuanya **strict** — sekali dipakai, tidak akan pernah
+Tiga lapis proteksi, semuanya **strict** - sekali dipakai, tidak akan pernah
 dipakai lagi:
 
 ### 1. Port registry permanen
@@ -93,23 +93,23 @@ dipakai lagi:
 - Nama tunnel = `<instance>-gateway` (mis. `antseed1-gateway`).
 - **Sebelum** dipakai, script mengambil daftar **semua tunnel** di akun Cloudflare
   dan memeriksa bentrok. Kalau nama sudah dipakai tunnel **asing** (bukan milik
-  fleet ini) → otomatis digenerate `<instance>-gateway-2`, `-3`, … sampai bebas.
+  fleet ini) -> otomatis digenerate `<instance>-gateway-2`, `-3`, ... sampai bebas.
 - Nama yang dipakai dicatat di `/etc/antseed-fleet/tunnels.reserved`.
 - Kalau tunnel itu **milik instance yang sama** (ada `TUNNEL_ID` di state), tetap
   di-reuse supaya `antseed-fleet restore` bekerja normal.
 
 ### 3. Hostname / subdomain unik
-- Nomor host (`api1`, `api2`, …) diambil dari max nomor lokal + 1, lalu dicek:
-  - ada di `/etc/antseed-fleet/hosts.reserved`? → skip
-  - ada CNAME di zona Cloudflare? → skip
+- Nomor host (`api1`, `api2`, ...) diambil dari max nomor lokal + 1, lalu dicek:
+  - ada di `/etc/antseed-fleet/hosts.reserved`? -> skip
+  - ada CNAME di zona Cloudflare? -> skip
 - Host yang dipakai dicatat permanen di `hosts.reserved`.
 
 ### 4. Global lock
 - Seluruh operasi create dilindungi `flock` di `/var/lock/antseed-fleet.lock`.
 - Dua proses `install.sh` yang jalan bersamaan tidak bisa mendapat port/nama/host
-  yang sama — yang kedua menunggu, atau berhenti dengan pesan jelas.
+  yang sama - yang kedua menunggu, atau berhenti dengan pesan jelas.
 
-### 5. Dry-run preview — `antseed-fleet check`
+### 5. Dry-run preview - `antseed-fleet check`
 
 Sebelum benar-benar membuat instance, lihat dulu rencana alokasinya:
 
@@ -118,7 +118,7 @@ sudo CF_API_TOKEN=cf_xxx antseed-fleet check --domain seaku.dev --name api --cou
 ```
 
 Output: tabel `SLOT | HOST | GW PORT | BUYER PORT | TUNNEL | CONFLICT`.
-Tidak membuat atau mereservasi apapun — murni preview.
+Tidak membuat atau mereservasi apapun - murni preview.
 
 ## Kelola
 
@@ -150,7 +150,7 @@ dengan status live (`GW_LIVE` / `BUYER_LIVE` = port benar-benar listening).
 Sengaja **tidak ada** perintah untuk "lepaskan" port / nama / host dari registry.
 Itu by design: nama yang sudah dipakai (wallet masih ada, backup masih ada) atau
 port yang pernah dipakai bisa bentrok kalau di-reuse. Kalau benar-benar perlu
-reset (misal ganti VPS bersih), hapus file registry secara manual — sadar risiko.
+reset (misal ganti VPS bersih), hapus file registry secara manual - sadar risiko.
 
 ## Troubleshooting: host mengembalikan 404 / hilang
 
@@ -167,8 +167,8 @@ di `/etc/antseed-fleet/<nama>.env`.
 
 ## Token Cloudflare
 
-Buat di <https://dash.cloudflare.com/profile/api-tokens> →
-**Create Token** → **Create Custom Token**:
+Buat di <https://dash.cloudflare.com/profile/api-tokens> ->
+**Create Token** -> **Create Custom Token**:
 
 | Scope | Resource | Level |
 |---|---|---|
@@ -177,7 +177,7 @@ Buat di <https://dash.cloudflare.com/profile/api-tokens> →
 | Zone | DNS | Edit |
 | Zone | Zone | Read |
 
-Account Resources: akun kamu · Zone Resources: **All zones from an account**
+Account Resources: akun kamu * Zone Resources: **All zones from an account**
 (supaya semua domain bisa dipilih). Token hanya dipakai saat create dan tidak
 disimpan ke disk - boleh di-revoke setelah selesai.
 
@@ -238,6 +238,6 @@ saat diminta.
 - **Strict registry** (`ports.reserved`, `tunnels.reserved`, `hosts.reserved`).
 - **Collision check** tunnel terhadap seluruh akun Cloudflare.
 - **Global `flock`** untuk mencegah race condition.
-- **`antseed-fleet check`** — dry-run preview alokasi.
-- **`antseed-fleet ports`** — lihat registry & status live.
+- **`antseed-fleet check`** - dry-run preview alokasi.
+- **`antseed-fleet ports`** - lihat registry & status live.
 - State file sekarang menyimpan `TUNNEL_NAME` (backward compatible).

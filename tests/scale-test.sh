@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# scale-test.sh — allocate N pairs from a huge window and verify speed/uniqueness.
+# scale-test.sh - allocate N pairs from a huge window and verify speed/uniqueness.
 # Self-contained: stubs the system layer, pulls alloc_ports out of install.sh.
 set -Eeuo pipefail
 HERE=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)

@@ -1,16 +1,16 @@
 #!/usr/bin/env bash
-# antseed-fleet Ã¢â‚¬â€ many independent Antseed gateways on one VPS.
+# antseed-fleet - many independent Antseed gateways on one VPS.
 #
-# v2.0.0 Ã¢â‚¬â€ collision-proof edition:
-#   * STRICT port registry: a port, once allocated, is never reused Ã¢â‚¬â€ not even
+# v2.0.0 - collision-proof edition:
+#   * STRICT port registry: a port, once allocated, is never reused - not even
 #     after an instance is removed (persisted in <state>/ports.reserved).
 #   * Global lock so two installers running at the same time cannot pick the
 #     same ports, tunnel names or hostnames.
 #   * Tunnel names are checked against the whole Cloudflare account, not just
-#     local state; a foreign tunnel with a clashing name is never hijacked Ã¢â‚¬â€
+#     local state; a foreign tunnel with a clashing name is never hijacked -
 #     a new name (<inst>-gateway-2, -3, ...) is generated instead.
 #   * Hostnames are checked against live DNS before they are handed out.
-#   * Scales to thousands of instances (adaptive port range, no fixed windows).
+#   * Scales to thousands of instances (high-water-mark port allocator).
 #
 #   bash install.sh          (or: curl -fsSL <get.sh> | sudo bash)
 #
@@ -43,19 +43,15 @@ PORT_HWM="$STATE_DIR/ports.hwm"
 NAME_REGISTRY="$STATE_DIR/tunnels.reserved"
 HOST_REGISTRY="$STATE_DIR/hosts.reserved"
 
-# Adaptive port range. With thousands of instances you want a wide window that
-# does not collide with the usual suspects (antseed base 8377/8379, common
-# daemons 8000-8380, ephemeral 32768+). 20000-40000 gives ~20000 slots = 10000
-# instances (gw+buyer each). Override with ANTSEED_PORT_RANGE="lo hi".
+# Adaptive port range. Kept clear of the antseed base services (8377/8379) and
+# the common daemon range, wide enough for thousands of instances.
 PORT_RANGE_LO="${ANTSEED_PORT_RANGE_LO:-20000}"
 PORT_RANGE_HI="${ANTSEED_PORT_RANGE_HI:-40000}"
 
 ASSUME_YES=0
-
 INSTANCE_NAME=""
 DOMAIN=""
 
-# flags (also settable by environment)
 while (( $# )); do
   case $1 in
     --token)   CF_API_TOKEN=$2; shift 2 ;;
@@ -83,22 +79,20 @@ else
   C_R=''; C_G=''; C_Y=''; C_B=''; C_D=''; C_BOLD=''; C_0=''
 fi
 
-step() { printf '\n%s\n' "${C_B}${C_BOLD}Ã¢â€“Â¸ $*${C_0}"; }
+step() { printf '\n%s\n' "${C_B}${C_BOLD}> $*${C_0}"; }
 info() { printf '%s\n' "${C_B}==>${C_0} $*"; }
-ok()   { printf '%s\n' "${C_G}  Ã¢Å“â€${C_0} $*"; }
-warn() { printf '%s\n' "${C_Y}  !${C_0} $*" >&2; }
-die() { # die "message" [exit-code]
+ok()   { printf '%s\n' "${C_G}[ok]${C_0} $*"; }
+warn() { printf '%s\n' "${C_Y}[!!]${C_0} $*" >&2; }
+die() {
   local code=1
   if (( $# >= 2 )) && [[ ${!#} =~ ^[0-9]+$ ]]; then
     code=${!#}
     set -- "${@:1:$(($# - 1))}"
   fi
-  printf '%s\n' "${C_R}  Ã¢Å“Ëœ $*${C_0}" >&2
+  printf '%s\n' "${C_R}[x] $*${C_0}" >&2
   exit "$code"
 }
 
-# interactive only when we have a terminal to ask on. stdin is a pipe when the
-# script is started with "curl ... | sudo bash", so /dev/tty is what matters.
 have_tty() { ( exec 3<>/dev/tty ) 2>/dev/null; }
 
 interactive() {
@@ -107,7 +101,7 @@ interactive() {
   have_tty
 }
 
-ask() { # ask "prompt" [default] -> echoes the answer
+ask() {
   local prompt=$1 default=${2:-} answer=
   if [[ $ASSUME_YES -eq 0 ]] && have_tty; then
     if [[ -n $default ]]; then
@@ -122,19 +116,18 @@ ask() { # ask "prompt" [default] -> echoes the answer
   fi
 }
 
-ask_secret() { # never echoed; reads from the terminal
+ask_secret() {
   local prompt=$1 answer=
   if [[ $ASSUME_YES -eq 0 ]] && have_tty; then
     read -r -s -p "$prompt: " answer </dev/tty || true
     printf '\n' >/dev/tty
   elif [[ $ASSUME_YES -eq 0 && ! -t 0 && ! -p /dev/stdin ]]; then
-    # stdin still has data (e.g. here-string); never block on an empty pipe
     read -r answer || true
   fi
   printf '%s' "$answer"
 }
 
-confirm() { # confirm "question" -> 0 yes, 1 no
+confirm() {
   local q=$1 answer
   [[ $ASSUME_YES -eq 0 ]] || return 0
   have_tty || return 0
@@ -160,7 +153,7 @@ ensure_cli() {
     ok "Antseed CLI present"
     return 0
   fi
-  info "Antseed CLI not found Ã¢â‚¬â€ installing the base gateway (Node.js + CLI)"
+  info "Antseed CLI not found - installing the base gateway (Node.js + CLI)"
   curl -fsSL --proto '=https' --tlsv1.2 "$INSTALL_SH" | bash -s -- --public-url "http://127.0.0.1:8379" >/tmp/antseed-base-install.log 2>&1 || {
     tail -20 /tmp/antseed-base-install.log >&2
     die "base gateway install failed (log: /tmp/antseed-base-install.log)"
@@ -183,7 +176,7 @@ cf() {
   fi
 }
 
-cfj() { # cfj <js-expression> [argv...]
+cfj() {
   local expr=$1
   shift || true
   node -e '
@@ -211,7 +204,7 @@ cf_verify() {
   ACCOUNT_NAME=$(head -1 <<<"$accounts" | cut -f2)
 }
 
-list_zones() { # one "name<TAB>id<TAB>status" per line
+list_zones() {
   cf GET "/zones?per_page=50" | cfj '(j.result||[]).map(z => z.name + "\t" + z.id + "\t" + z.status).join("\n")'
 }
 
@@ -222,7 +215,7 @@ cf_zone_id() {
   return 1
 }
 
-zone_root() { # api3.example.com -> example.com
+zone_root() {
   local host=$1
   host=${host#*.}
   while [[ $host == *.* ]]; do
@@ -238,7 +231,7 @@ mem_total_mib() { awk '/MemTotal/ { printf "%d", $2 / 1024 }' /proc/meminfo; }
 mem_avail_mib() { awk '/MemAvailable/ { printf "%d", $2 / 1024 }' /proc/meminfo; }
 disk_avail_mib() { df -Pm /var/lib | awk 'NR == 2 { print $4 }'; }
 
-print_sizing_table() { # print_sizing_table <fits-now> <budget-per-instance> <total-ram-of-this-vps>
+print_sizing_table() {
   local fits=$1 mine=$(( ($3 + 512) / 1024 )) t rec row total fit
   printf '    %-9s %-16s %-9s %s\n' "RAM VPS" "BUDGET" "FITS" "MARK"
   printf '    %-9s %-16s %-9s %s\n' "--------" "----------------" "---------" "----"
@@ -257,7 +250,6 @@ print_sizing_table() { # print_sizing_table <fits-now> <budget-per-instance> <to
   printf '    %-9s %-16s %-9s%s\n' "now" "free RAM" "$fits" "  <- can be created right now"
 }
 
-# how many new instances this VPS can take right now
 recommend_count() {
   local avail by_mem by_disk
   avail=$(mem_avail_mib)
@@ -269,17 +261,15 @@ recommend_count() {
 
 # ------------------------------------------------------------- naming
 
-sanitize_name() { # lowercase, [a-z0-9-], no leading/trailing dash
+sanitize_name() {
   local n
   n=$(printf '%s' "$1" | tr '[:upper:]' '[:lower:]' | sed -e 's/[^a-z0-9-]/-/g' -e 's/--*/-/g' -e 's/^-//' -e 's/-$//')
   printf '%s' "$n"
 }
 
-host_for() { # host_for <name> <n> <domain>
-  printf '%s%d.%s' "$1" "$2" "$3"
-}
+host_for() { printf '%s%d.%s' "$1" "$2" "$3"; }
 
-next_host_num() { # next number for the given name, taken from the local instances
+next_host_num() {
   local name=$1 max=0 host
   for host in $(existing_instances | awk '{ print $2 }'); do
     if [[ $host =~ ^${name}([0-9]+)\. ]]; then
@@ -289,17 +279,14 @@ next_host_num() { # next number for the given name, taken from the local instanc
   echo $((max + 1))
 }
 
-host_taken_by_other() { # host_taken_by_other <host> -> router of the CNAME, if any
+host_taken_by_other() {
   local rec
   rec=$(cf GET "/zones/$ZONE_ID/dns_records?name=$1" 2>/dev/null |
     cfj '(j.result[0] && j.result[0].content) || ""' || true)
   printf '%s' "$rec"
 }
 
-# every instance needs its own tunnel: cloudflared replaces the whole ingress
-# list on each config version, so two instances sharing one tunnel would knock
-# each other's hostname off.
-assert_tunnel_owner() { # assert_tunnel_owner <instance> <tunnel-id>
+assert_tunnel_owner() {
   local owner remote
   remote=$(cf GET "/accounts/$ACCOUNT_ID/cfd_tunnel/$2" 2>/dev/null |
     cfj 'j.result?.name || ""' || true)
@@ -308,22 +295,20 @@ assert_tunnel_owner() { # assert_tunnel_owner <instance> <tunnel-id>
     [[ $owner == "$1" ]] && continue
     local other
     other=$(sed -n 's/^TUNNEL_ID=//p' "$(state_file "$owner")" 2>/dev/null || true)
-    [[ $other == "$2" ]] && die "tunnel $2 already belongs to $owner Ã¢â‚¬â€ refusing to share it" 3
+    [[ $other == "$2" ]] && die "tunnel $2 already belongs to $owner - refusing to share it" 3
   done
   [[ $remote == "$1-gateway" || $remote == "$1-gateway-"* ]] ||
-    die "tunnel $2 is named '$remote', not '$1-gateway*' Ã¢â‚¬â€ refusing to reuse it" 3
+    die "tunnel $2 is named '$remote', not '$1-gateway*' - refusing to reuse it" 3
 }
 
 # ---------------------------------------------------------- strict registries
 
-# A single global lock so two concurrent installers cannot hand out the same
-# port, tunnel name or hostname. Released when the script exits.
 acquire_lock() {
   install -d -m 755 "$STATE_DIR"
   mkdir -p "$(dirname "$LOCK_FILE")"
   exec 9>"$LOCK_FILE"
   if ! flock -w 120 9; then
-    die "another antseed-fleet run is holding the lock ($LOCK_FILE) Ã¢â‚¬â€ try again in a moment" 3
+    die "another antseed-fleet run is holding the lock ($LOCK_FILE) - try again in a moment" 3
   fi
 }
 
@@ -336,9 +321,7 @@ registry_touch() {
 reserve_port() {
   local p=$1 cur=0
   echo "$p" >>"$PORT_REGISTRY"
-  # keep the O(1) high-water mark in sync: the highest port ever reserved + 1.
-  # Reservations are monotonically increasing for fresh instances, so this is
-  # just a max() against whatever is on disk.
+  # keep the O(1) high-water mark in sync: highest port ever reserved + 1.
   [[ -f $PORT_HWM ]] && cur=$(cat "$PORT_HWM" 2>/dev/null || echo 0)
   [[ $cur =~ ^[0-9]+$ ]] || cur=0
   [[ $p =~ ^[0-9]+$ ]] || return 0
@@ -375,13 +358,6 @@ existing_instances() {
 
 instance_exists() { [[ -f $(state_file "$1") ]]; }
 
-next_index() {
-  local i=1 used
-  used=$(instance_names)
-  while grep -qx "${PREFIX}${i}" <<<"$used"; do i=$((i + 1)); done
-  echo "$i"
-}
-
 load_instance() {
   local f
   [[ -n ${1:-} ]] || die "instance name required"
@@ -397,28 +373,18 @@ as_instance() {
 }
 
 # ---- port probing -------------------------------------------------------
-# Anything that could ever bind these ports counts as busy:
-#   * listeners in ss (TCP + UDP, v4 + v6)
-#   * sockets seen in /proc/net/{tcp,tcp6,udp,udp6}
-#   * ports declared by other systemd units (Loaded/ExecStart --port N)
-#   * /etc/services
-#   * TIME_WAIT / established connections (a fast restart would still fail)
 port_busy() {
   local p=$1
-  # ss: local or peer address ends with :p (any state)
   if ss -Htanu 2>/dev/null | awk -v p="$p" '
       { n = split($4, a, /[:.]/); if (a[n] == p) { f = 1; exit }
         n = split($5, b, /[:.]/); if (b[n] == p) { f = 1; exit } }
       END { exit f ? 0 : 1 }'; then return 0; fi
-  # raw /proc fallback: 4th column is local_address in hex : port
   local hex
   hex=$(printf '%04X' "$p")
   if grep -qiE ":$hex[[:space:]]" /proc/net/tcp /proc/net/tcp6 /proc/net/udp /proc/net/udp6 2>/dev/null; then
     return 0
   fi
-  # other systemd units declaring this port
   if grep -rqsE -- "--port[= ][\"']?$p([\"' ]|$)" "$UNIT_DIR" 2>/dev/null; then return 0; fi
-  # /etc/services
   if grep -qE "[[:space:]]${p}/" /etc/services 2>/dev/null; then return 0; fi
   return 1
 }
@@ -430,39 +396,30 @@ baseline_ports() {
   echo "8379 ${bport:-8377}"
 }
 
-
-# Strict allocator: never reuse a port that is listening, reserved by the
-# registry, referenced by another unit, or listed in /etc/services.
+# Strict allocator. Never reuses a port that is listening, reserved by the
+# registry, used by another unit, or listed in /etc/services.
 #
 # Scalability: the registry is append-only and ports are handed out in
-# increasing order, so "everything below the high-water mark is taken" and the
-# next candidate is simply the HWM. The HWM is cached in ports.hwm, so the
-# common path costs one file read â€” O(1) per allocation, which is what lets
-# this serve thousands of instances without quadratic behaviour. A full
-# wrap-around scan (with a memoised busy-set) is only used once the HWM reaches
-# the end of the window.
+# increasing order, so everything below the high-water mark is taken and the
+# next candidate is simply the HWM (cached in ports.hwm -> O(1) per call).
+# Live sockets are read once from /proc/net into a string, so probing a
+# candidate costs no subprocess. A full wrap-around scan is only needed once
+# the HWM reaches the end of the window.
 alloc_ports() {
   local gw="" buyer=""
   local max_tries=$(( PORT_RANGE_HI - PORT_RANGE_LO + 1 ))
-
-  # base services (8377/8379) must never be handed out
   local base_live; base_live=" $(baseline_ports) "
 
-  # ---- preload live ports once (pure bash, no per-probe subprocesses) ----
-  # /proc/net/{tcp,tcp6,udp,udp6} list every local socket with the port in the
-  # 2nd field as hex (local_address = HEXIP:HEXPORT). Pulling them into one
-  # newline-wrapped string lets live_free do an O(1) substring test instead of
-  # spawning ss/grep/awk for every candidate port — the difference between
-  # seconds and minutes when allocating thousands of instances.
+  # preload live ports once (pure bash)
   local live_ports=" "
   local _f _line _local _hexport _dec _first
   for _f in /proc/net/tcp /proc/net/tcp6 /proc/net/udp /proc/net/udp6; do
     [[ -r $_f ]] || continue
     _first=1
     while IFS= read -r _line; do
-      if (( _first )); then _first=0; continue; fi   # skip the header line
-      _local=${_line#*: }                            # drop "sl " column
-      _local=${_local%% *}                           # LOCAL address field
+      if (( _first )); then _first=0; continue; fi
+      _local=${_line#*: }
+      _local=${_local%% *}
       _hexport=${_local##*:}
       [[ $_hexport =~ ^[0-9A-Fa-f]{1,4}$ ]] || continue
       _dec=$(( 16#$_hexport ))
@@ -470,7 +427,6 @@ alloc_ports() {
     done <"$_f"
   done
 
-  # candidate liveness probe (no registry lookup — used above the HWM)
   live_free() {
     local p=$1
     (( p < PORT_RANGE_LO || p > PORT_RANGE_HI )) && return 1
@@ -479,11 +435,10 @@ alloc_ports() {
     return 0
   }
 
-  # ---- high-water mark ----------------------------------------------------
+  # high-water mark
   local hw=""
   [[ -f $PORT_HWM ]] && hw=$(cat "$PORT_HWM" 2>/dev/null || true)
   if ! [[ $hw =~ ^[0-9]+$ ]]; then
-    # cold start / corrupt cache: recompute once from the registry + state
     local reserved
     reserved=$(instance_names | while read -r n; do
       local f="$STATE_DIR/$n.env"
@@ -500,8 +455,8 @@ alloc_ports() {
     echo "$hw" >"$PORT_HWM" 2>/dev/null || true
   fi
   (( hw < PORT_RANGE_LO )) && hw=$PORT_RANGE_LO
+
   if (( hw <= PORT_RANGE_HI )); then
-    # fast path: probe just above the mark; nothing there is in the registry
     local p=$hw i
     for (( i = 0; i < max_tries; i++ )); do
       if (( p > PORT_RANGE_HI )); then p=$PORT_RANGE_LO; fi
@@ -512,7 +467,7 @@ alloc_ports() {
           (( p != gw )) && live_free "$p" && buyer=$p
         fi
       else
-        break   # wrapped back below the HWM: switch to the exact scan
+        break
       fi
       [[ -n $gw && -n $buyer ]] && break
       p=$((p + 1))
@@ -523,8 +478,7 @@ alloc_ports() {
     fi
   fi
 
-  # ---- exact scan (window is nearly full) --------------------------------
-  # Build a busy-set once (associative array, O(total)) and walk the window.
+  # exact scan (window nearly full): build a busy-set once, walk the window
   gw=""; buyer=""
   declare -A busy=()
   local port
@@ -535,10 +489,8 @@ alloc_ports() {
       [[ -f $f ]] && ( . "$f"; echo "$GW_PORT"; echo "$BUYER_PORT" )
     done
     tr ' ' '\n' <<<"$base_live"
-  } | tr -s '[:space:]' '\n' | awk 'NF' | while read -r port; do
-    [[ $port =~ ^[0-9]+$ ]] && echo "$port"
-  done >"$STATE_DIR/.busy.$$"
-  while read -r port; do busy[$port]=1; done <"$STATE_DIR/.busy.$$"
+  } | tr -s '[:space:]' '\n' | awk 'NF' >"$STATE_DIR/.busy.$$"
+  while IFS= read -r port; do busy[$port]=1; done <"$STATE_DIR/.busy.$$"
   rm -f "$STATE_DIR/.busy.$$"
 
   port=$PORT_RANGE_LO
@@ -556,9 +508,10 @@ alloc_ports() {
     (( port > PORT_RANGE_HI )) && port=$PORT_RANGE_LO
   done
 
-  [[ -n $gw && -n $buyer ]] || die "no free ports in $PORT_RANGE_LO-$PORT_RANGE_HI â€” widen ANTSEED_PORT_RANGE_*" 3
+  [[ -n $gw && -n $buyer ]] || die "no free ports in $PORT_RANGE_LO-$PORT_RANGE_HI - widen ANTSEED_PORT_RANGE_*" 3
   printf '%s %s\n' "$gw" "$buyer"
 }
+
 wait_port() {
   local port=$1 tries=${2:-60} i
   for (( i = 0; i < tries; i++ )); do
@@ -569,16 +522,11 @@ wait_port() {
 }
 
 # ---- tunnel name allocator ----------------------------------------------
-# Fetch every non-deleted tunnel in the account once, then pick a free name.
 cf_tunnel_names() {
   cf GET "/accounts/$ACCOUNT_ID/cfd_tunnel?is_deleted=false&per_page=200" 2>/dev/null |
     cfj '(j.result||[]).map(t => t.name).join("\n")' || true
 }
 
-# alloc_tunnel_name <instance> -> prints a name that is not used by any tunnel
-# in Cloudflare AND not present in the local name registry. If <instance>-gateway
-# is owned by this very instance (state file with matching TUNNEL_ID) it is
-# returned, so `restore` keeps working.
 alloc_tunnel_name() {
   local inst=$1
   local all_tunnels
@@ -593,16 +541,13 @@ alloc_tunnel_name() {
   while (:); do
     local taken=0
     if [[ -n $own_id ]]; then
-      # our own tunnel may legitimately carry this name
       local owner_name
       owner_name=$(cf GET "/accounts/$ACCOUNT_ID/cfd_tunnel/$own_id" 2>/dev/null |
         cfj 'j.result?.name || ""' || true)
       [[ $owner_name == "$candidate" ]] && { printf '%s' "$candidate"; return 0; }
     fi
-    if grep -qxF -- "$candidate" <<<"$all_tunnels"; then taken=1; fi
-    if name_in_registry "$candidate"; then
-      # Strict registry: a name that was ever handed out is taken, UNLESS the
-      # state file of this very instance records it as ours (idempotent rerun).
+    grep -qxF -- "$candidate" <<<"$all_tunnels" && taken=1
+    if name_in_registry "$candidate" && (( taken == 0 )); then
       local st="$STATE_DIR/$inst.env"
       if [[ -f $st ]]; then
         local rn; rn=$(sed -n 's/^TUNNEL_NAME=//p' "$st" | head -1)
@@ -612,18 +557,15 @@ alloc_tunnel_name() {
       fi
     fi
     (( taken == 0 )) && { printf '%s' "$candidate"; return 0; }
-    candidate="$inst-gateway-$n"
-    n=$((n + 1))
+    candidate="$inst-gateway-$n"; n=$((n + 1))
     (( n > 9999 )) && die "cannot find a free tunnel name for $inst (checked 9999 variants)" 3
   done
 }
 
 # ---- host allocator -----------------------------------------------------
-# next host number that is free locally, in the reserved-host registry AND in
-# live DNS (if the zone is reachable).
-alloc_host() { # alloc_host <name> <domain> -> prints <nameN>.<domain>
-  local name=$1 domain=$2 n
-  n=$(next_host_num "$name")
+alloc_host() {
+  local name=$1 domain=$2
+  local n; n=$(next_host_num "$name")
   local guard=0
   while (:); do
     local h; h=$(host_for "$name" "$n" "$domain")
@@ -712,7 +654,7 @@ WantedBy=multi-user.target
 UNIT
 }
 
-create_one() { # create_one <instance> <host> <zone-id> <domain>
+create_one() {
   local inst=$1 host=$2 zone_id=$3 domain=$4
   local user=$inst home gw_port buyer_port tunnel_id tunnel_name
 
@@ -732,14 +674,11 @@ create_one() { # create_one <instance> <host> <zone-id> <domain>
   reserve_port "$buyer_port"
   ok "ports gateway=$gw_port buyer=$buyer_port (reserved strictly)"
 
-  # Collision-proof tunnel name: check the whole Cloudflare account, not just
-  # local state. A foreign tunnel with a clashing name forces a new suffix.
   tunnel_name=$(alloc_tunnel_name "$inst")
   reserve_name "$tunnel_name"
   tunnel_id=$(cf GET "/accounts/$ACCOUNT_ID/cfd_tunnel?name=$tunnel_name&is_deleted=false" 2>/dev/null |
     cfj 'j.result[0]?.id || ""' || true)
   if [[ -n $tunnel_id ]]; then
-    # Only reuse when this tunnel is provably ours.
     assert_tunnel_owner "$inst" "$tunnel_id"
     ok "reusing tunnel $tunnel_name ($tunnel_id)"
   else
@@ -823,8 +762,6 @@ create_one() { # create_one <instance> <host> <zone-id> <domain>
     } >"$(state_file "$inst")"
   )
 
-  # verify through the tunnel: the answer must carry this gateway's tag, so a
-  # stale or shared tunnel config (wrong gateway answering) is caught here
   local i up=0 code tag body tagline="x-antseed-gateway-tag: "
   for (( i = 0; i < 30; i++ )); do
     body=$(curl -sS -m 20 -D - -o /dev/null "https://$host/v1/models" \
@@ -841,7 +778,7 @@ create_one() { # create_one <instance> <host> <zone-id> <domain>
     warn "https://$host/v1/models -> 200 but no gateway tag (answered by a proxy?)"
   else
     warn "https://$host/v1/models -> ${code:-no response}"
-    warn "the tunnel config did not take effect Ã¢â‚¬â€ check: antseed-fleet status $inst"
+    warn "the tunnel config did not take effect - check: antseed-fleet status $inst"
   fi
   (( up )) || warn "tunnel still connecting"
 
@@ -865,7 +802,7 @@ step "Antseed fleet installer $VERSION"
 
 # ---------------------------------------------------------- 1/5 token
 
-step "1/5 Ã‚Â· Cloudflare API token"
+step "1/5 - Cloudflare API token"
 if [[ -z ${CF_API_TOKEN:-} ]]; then
   cat <<'TXT' >&2
 
@@ -899,9 +836,9 @@ ok "account: $ACCOUNT_NAME"
 
 # ---------------------------------------------------------- 2/5 domain
 
-step "2/5 Ã‚Â· Domain"
+step "2/5 - Domain"
 ZONES=$(list_zones)
-[[ -n $ZONES ]] || die "this token cannot see any zone Ã¢â‚¬â€ check Zone | Zone | Read for your zone" 1
+[[ -n $ZONES ]] || die "this token cannot see any zone - check Zone | Zone | Read for your zone" 1
 
 mapfile -t ZONE_NAMES < <(cut -f1 <<<"$ZONES")
 mapfile -t ZONE_IDS < <(cut -f2 <<<"$ZONES")
@@ -940,7 +877,7 @@ if [[ -z $DOMAIN ]]; then
       if (( pick >= 1 && pick <= ${#ZONE_NAMES[@]} )); then
         DOMAIN=${ZONE_NAMES[$((pick - 1))]}
       else
-        warn "no domain number $pick Ã¢â‚¬â€ pick 1..${#ZONE_NAMES[@]}"
+        warn "no domain number $pick - pick 1..${#ZONE_NAMES[@]}"
         pick=""
       fi
     else
@@ -950,7 +887,6 @@ if [[ -z $DOMAIN ]]; then
   done
 fi
 
-# accept https://api.example.com/ and keep the zone part
 DOMAIN=${DOMAIN#http://}; DOMAIN=${DOMAIN#https://}
 DOMAIN=${DOMAIN%%/*}
 if ! zone_id_for "$DOMAIN" >/dev/null; then
@@ -965,7 +901,7 @@ ok "domain: $DOMAIN   (zone $ZONE_ID)"
 
 # ---------------------------------------------------------- 3/5 name
 
-step "3/5 Ã‚Â· Name"
+step "3/5 - Name"
 san_name() {
   local n
   n=$(sanitize_name "$1")
@@ -975,7 +911,7 @@ san_name() {
   printf '%s' "$n"
 }
 
-same_name_used() { # how many instances already use this prefix
+same_name_used() {
   local name=$1 n=0 h
   for h in $(existing_instances | awk '{ print $2 }'); do
     if [[ $h =~ ^${name}[0-9]+\. ]]; then n=$((n + 1)); fi
@@ -993,7 +929,7 @@ if [[ -z $INSTANCE_NAME ]]; then
   done
   INSTANCE_NAME=$(ask "  Name for the instances (letters, digits, dash)" "$guess")
 fi
-INSTANCE_NAME=$(san_name "$INSTANCE_NAME") || die "invalid name Ã¢â‚¬â€ use letters, digits and dashes, e.g. api or gateway" 1
+INSTANCE_NAME=$(san_name "$INSTANCE_NAME") || die "invalid name - use letters, digits and dashes, e.g. api or gateway" 1
 
 prio=""
 [[ $INSTANCE_NAME =~ ^(buyer|gateway|tunnel|cloudflared|antseed|console|admin|root|system)$ ]] &&
@@ -1008,7 +944,7 @@ printf '    %-14s %s\n' "then" "https://$(host_for "$INSTANCE_NAME" 2 "$DOMAIN")
 
 # ---------------------------------------------------------- 4/5 how many
 
-step "4/5 Ã‚Â· This VPS and how many"
+step "4/5 - This VPS and how many"
 ensure_cli
 read -r rec by_disk avail <<<"$(recommend_count)"
 used=$(existing_instances | wc -l)
@@ -1017,7 +953,7 @@ mem_total=$(mem_total_mib)
 disk_free=$(disk_avail_mib)
 already=$(same_name_used "$INSTANCE_NAME")
 
-printf '    %-24s %s\n' "CPUs" "$(nproc)${cpu_model:+ Ãƒâ€” $cpu_model}"
+printf '    %-24s %s\n' "CPUs" "$(nproc)${cpu_model:+ x $cpu_model}"
 printf '    %-24s %s MiB (%s GB)\n' "RAM total" "$mem_total" "$(awk -v m="$mem_total" 'BEGIN { printf "%.1f", m / 1024 }')"
 printf '    %-24s %s MiB\n' "RAM available" "$avail"
 printf '    %-24s %s MiB (%s GB)\n' "Disk free" "$disk_free" "$(awk -v m="$disk_free" 'BEGIN { printf "%.0f", m / 1024 }')"
@@ -1042,7 +978,7 @@ else
         continue
       }
       (( count > rec )) && {
-        warn "$count is above the recommendation ($rec) Ã¢â‚¬â€ the VPS may run out of memory"
+        warn "$count is above the recommendation ($rec) - the VPS may run out of memory"
         confirm "  Continue anyway?" || { count=""; continue; }
       }
       (( count > 0 )) && break
@@ -1058,19 +994,14 @@ fi
 acquire_lock
 registry_touch
 
-start_num=$(next_host_num "$INSTANCE_NAME" "$DOMAIN")
 hosts=()
 names=()
 for (( i = 0; i < count; i++ )); do
-  # allocate host through the strict allocator (checks registry + live DNS)
   h=$(alloc_host "$INSTANCE_NAME" "$DOMAIN")
   hosts+=("$h")
   reserve_host "$h"
-  # bump n for the next loop iteration by recomputing from the chosen host
-  [[ $h =~ ^${INSTANCE_NAME}([0-9]+)\. ]] && start_num=${BASH_REMATCH[1]}
 done
 
-# instance ids: keep antseedN going, never colliding with an existing one
 idx=1
 for (( i = 0; i < count; i++ )); do
   while instance_exists "${PREFIX}${idx}"; do idx=$((idx + 1)); done
@@ -1078,7 +1009,7 @@ for (( i = 0; i < count; i++ )); do
   idx=$((idx + 1))
 done
 
-step "5/5 Ã‚Â· Creating $count instance(s)"
+step "5/5 - Creating $count instance(s)"
 printf '    %-14s %s\n' "INSTANCE" "PUBLIC URL"
 for i in "${!hosts[@]}"; do
   printf '    %-14s https://%s/v1\n' "${names[$i]}" "${hosts[$i]}"
@@ -1094,10 +1025,10 @@ for i in "${!hosts[@]}"; do
   echo
 done
 
-step "Done Ã¢â‚¬â€ $created instance(s) created"
+step "Done - $created instance(s) created"
 printf '    %-12s %s\n' "NAME" "BASE URL"
 existing_instances | while read -r n h; do printf '    %-12s https://%s/v1\n' "$n" "$h"; done
 echo
 info "manage with: antseed-fleet list | status | link NAME | logs NAME -f | remove NAME"
-info "API keys are shown once above Ã¢â‚¬â€ save them now"
+info "API keys are shown once above - save them now"
 info "run 'antseed-fleet check --domain $DOMAIN --name $INSTANCE_NAME' next time to preview allocations"

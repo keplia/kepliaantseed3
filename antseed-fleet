@@ -1,11 +1,11 @@
 #!/usr/bin/env bash
-# antseed-fleet — manage the independent Antseed gateways created by install.sh.
+# antseed-fleet - manage the independent Antseed gateways created by install.sh.
 #
 # Instances are independent: system user, data dir, wallets, database, ports,
 # systemd units, Cloudflare tunnel and hostname (api2, api3, ...). Creating more
 # is always the same flow: bash install.sh
 #
-# v2.0.0 — collision-proof edition: strict port registry (no port is ever
+# v2.0.0 - collision-proof edition: strict port registry (no port is ever
 # reused), tunnel names checked against the whole Cloudflare account, global
 # lock, and a dry-run `check` command that shows the next free ports/names.
 #
@@ -45,9 +45,9 @@ if [[ -t 1 ]]; then
 else
   C_G=''; C_Y=''; C_B=''; C_D=''; C_BOLD=''; C_0=''
 fi
-ok()   { printf '%s\n' "${C_G}  ✔${C_0} $*"; }
+ok()   { printf '%s\n' "${C_G}  [ok]${C_0} $*"; }
 warn() { printf '%s\n' "${C_Y}  !${C_0} $*" >&2; }
-die()  { printf '%s\n' "  ✘ $*" >&2; exit 1; }
+die()  { printf '%s\n' "  [x] $*" >&2; exit 1; }
 
 state_file() { echo "$STATE_DIR/$1.env"; }
 
@@ -359,9 +359,9 @@ cmd_remove() {
     warn "delete it later with: antseed-fleet remove $name --keys"
   fi
   rm -f "$(state_file "$name")"
-  # NOTE: ports/hosts/tunnel names stay in the strict registries on purpose —
+  # NOTE: ports/hosts/tunnel names stay in the strict registries on purpose -
   # a removed instance must never have its port or name handed to a new one.
-  warn "tunnel $tunnel and DNS $host remain in Cloudflare — delete them in the dashboard if unused"
+  warn "tunnel $tunnel and DNS $host remain in Cloudflare - delete them in the dashboard if unused"
   warn "ports $GW_PORT/$BUYER_PORT and host $host stay reserved (strict mode)"
 }
 
@@ -433,10 +433,10 @@ cmd_check() {
       [[ -n $acc ]] && tunnels=$(cf_tunnel_names)
       ok "zone found ($zone), live DNS + tunnel checks enabled"
     else
-      warn "zone '$domain' not visible with the current token — DNS/tunnel checks skipped"
+      warn "zone '$domain' not visible with the current token - DNS/tunnel checks skipped"
     fi
   else
-    warn "CF_API_TOKEN not set — live DNS/tunnel checks skipped (registry-only)"
+    warn "CF_API_TOKEN not set - live DNS/tunnel checks skipped (registry-only)"
   fi
   echo
 
@@ -468,7 +468,7 @@ cmd_check() {
       tn="${tn}-${k}"
     fi
     name_in_registry "$tn" && conflicts+="tunnel-registry "
-    [[ -n $conflicts ]] || conflicts="—"
+    [[ -n $conflicts ]] || conflicts="-"
     printf '%-6s %-34s %-16s %-16s %-24s %s\n' "#$((i + 1))" "$h" "$gw" "$buyer" "$tn" "$conflicts"
     # reserve in a throwaway copy so the next row reflects the next free slot
     echo "$h" >>"$HOST_REGISTRY.tmp.$$"
@@ -476,7 +476,7 @@ cmd_check() {
   rm -f "$HOST_REGISTRY.tmp.$$"
   echo
   ok "no collision with existing instances, DNS records or tunnel names"
-  echo "${C_D}  This was a dry run — nothing was created or reserved.${C_0}"
+  echo "${C_D}  This was a dry run - nothing was created or reserved.${C_0}"
 }
 
 cmd_ports() {

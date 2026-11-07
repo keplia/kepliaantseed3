@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# test-allocator.sh — offline unit test for the strict allocators.
+# test-allocator.sh - offline unit test for the strict allocators.
 # No root, no Cloudflare, no systemd needed. Pure bash logic test: it pulls the
 # allocator functions straight out of install.sh and stubs the system layer.
 set -Eeuo pipefail
@@ -10,8 +10,8 @@ SRC="$HERE/../install.sh"
 [[ -f $SRC ]] || { echo "cannot find install.sh (looked at $SRC)" >&2; exit 1; }
 
 PASS=0; FAIL=0
-t_ok()   { PASS=$((PASS+1)); printf '  \033[32m✔\033[0m %s\n' "$1"; }
-t_fail() { FAIL=$((FAIL+1)); printf '  \033[31m✘\033[0m %s\n' "$1"; }
+t_ok()   { PASS=$((PASS+1)); printf '  \033[32m[ok]\033[0m %s\n' "$1"; }
+t_fail() { FAIL=$((FAIL+1)); printf '  \033[31m[x]\033[0m %s\n' "$1"; }
 t_is()   { if [[ "$2" == "$3" ]]; then t_ok "$1 ($3)"; else t_fail "$1 (expected '$3', got '$2')"; fi; }
 
 # ---- isolated sandbox ---------------------------------------------------
