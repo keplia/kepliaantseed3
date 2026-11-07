@@ -1,0 +1,9 @@
+# temp / editor
+*~
+*.swp
+.DS_Store
+
+# local runtime artifacts
+*.log
+*.tmp
+*.tmp.*

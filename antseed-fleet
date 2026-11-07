@@ -1,0 +1,567 @@
+#!/usr/bin/env bash
+# antseed-fleet — manage the independent Antseed gateways created by install.sh.
+#
+# Instances are independent: system user, data dir, wallets, database, ports,
+# systemd units, Cloudflare tunnel and hostname (api2, api3, ...). Creating more
+# is always the same flow: bash install.sh
+#
+# v2.0.0 — collision-proof edition: strict port registry (no port is ever
+# reused), tunnel names checked against the whole Cloudflare account, global
+# lock, and a dry-run `check` command that shows the next free ports/names.
+#
+# Commands
+#   list                     instances, ports, memory, host, state
+#   status [NAME]            systemd + live public API check
+#   keys NAME [--label L]    create another API key
+#   link NAME                new one-time console setup link
+#   recover NAME             recovery link for a claimed console
+#   logs NAME [-f]           gateway + buyer + cloudflared logs
+#   restart|start|stop [NAME]
+#   remove NAME [--keys]     delete services (--keys also deletes data)
+#   restore [NAME]           put the tunnel ingress + DNS back on the host
+#                            recorded for the instance (fixes a hijacked host)
+#   check                    dry-run: next free host/ports/tunnel for a prefix
+#   ports                    show the strict port registry + live usage
+#   doctor                   diagnose the deployment
+#
+set -Eeuo pipefail
+
+VERSION="2.0.0"
+PREFIX="${ANTSEED_FLEET_PREFIX:-antseed}"
+STATE_DIR="/etc/${PREFIX}-fleet"
+UNIT_DIR="/etc/systemd/system"
+CLI_BIN="/opt/antseed/current/bin/antseed"
+CLI_NODE_PATH="/opt/antseed/node/bin"
+LOCK_FILE="/var/lock/${PREFIX}-fleet.lock"
+PORT_REGISTRY="$STATE_DIR/ports.reserved"
+NAME_REGISTRY="$STATE_DIR/tunnels.reserved"
+HOST_REGISTRY="$STATE_DIR/hosts.reserved"
+PORT_RANGE_LO="${ANTSEED_PORT_RANGE_LO:-20000}"
+PORT_RANGE_HI="${ANTSEED_PORT_RANGE_HI:-40000}"
+CF_API="https://api.cloudflare.com/client/v4"
+
+if [[ -t 1 ]]; then
+  C_G=$'\033[32m'; C_Y=$'\033[33m'; C_B=$'\033[34m'; C_D=$'\033[2m'; C_BOLD=$'\033[1m'; C_0=$'\033[0m'
+else
+  C_G=''; C_Y=''; C_B=''; C_D=''; C_BOLD=''; C_0=''
+fi
+ok()   { printf '%s\n' "${C_G}  ✔${C_0} $*"; }
+warn() { printf '%s\n' "${C_Y}  !${C_0} $*" >&2; }
+die()  { printf '%s\n' "  ✘ $*" >&2; exit 1; }
+
+state_file() { echo "$STATE_DIR/$1.env"; }
+
+registry_touch() {
+  install -d -m 700 "$STATE_DIR" 2>/dev/null || true
+  touch "$PORT_REGISTRY" "$NAME_REGISTRY" "$HOST_REGISTRY" 2>/dev/null || true
+}
+
+port_in_registry() { grep -qx -- "$1" "$PORT_REGISTRY" 2>/dev/null; }
+name_in_registry() { grep -qix -- "$1" "$NAME_REGISTRY" 2>/dev/null; }
+host_in_registry() { grep -qix -- "$1" "$HOST_REGISTRY" 2>/dev/null; }
+
+acquire_lock() {
+  install -d -m 755 "$STATE_DIR" 2>/dev/null || true
+  mkdir -p "$(dirname "$LOCK_FILE")" 2>/dev/null || true
+  exec 9>"$LOCK_FILE" || true
+  flock -w 120 9 || die "another antseed-fleet run is holding the lock ($LOCK_FILE)"
+}
+
+instance_names() {
+  local f
+  for f in "$STATE_DIR"/*.env; do
+    [[ -e $f ]] || continue
+    basename "$f" .env
+  done | sort -V
+}
+
+existing_instances() {
+  local n
+  while read -r n; do
+    [[ -n $n ]] || continue
+    ( . "$(state_file "$n")"; echo "$INSTANCE $HOST" )
+  done <<<"$(instance_names)"
+}
+
+load_instance() {
+  local f
+  [[ -n ${1:-} ]] || die "instance name required (see: antseed-fleet list)"
+  f=$(state_file "$1")
+  [[ -f $f ]] || die "instance '$1' not found (see: antseed-fleet list)"
+  . "$f"
+}
+
+as_instance() {
+  local user=$1 home=$2
+  shift 2
+  runuser -u "$user" -- env HOME="$home" PATH="$CLI_NODE_PATH:/usr/bin:/bin" "$CLI_BIN" "$@"
+}
+
+cf() {
+  local method=$1 path=$2 body=${3:-}
+  if [[ -n $body ]]; then
+    curl -fsS -m 60 -X "$method" "$CF_API$path" \
+      -H "Authorization: Bearer $CF_API_TOKEN" \
+      -H "Content-Type: application/json" -d "$body"
+  else
+    curl -fsS -m 60 -X "$method" "$CF_API$path" \
+      -H "Authorization: Bearer $CF_API_TOKEN"
+  fi
+}
+
+cfj() {
+  local expr=$1; shift || true
+  node -e '
+let s = "";
+process.stdin.on("data", d => s += d).on("end", () => {
+  let j;
+  try { j = JSON.parse(s); }
+  catch (e) { console.error("bad JSON from Cloudflare"); process.exit(1); }
+  if (j.success === false) { console.error("Cloudflare error:", JSON.stringify(j.errors)); process.exit(1); }
+  const argv = process.argv.slice(2);
+  const v = eval(process.argv[1]);
+  process.stdout.write(v === undefined || v === null ? "" : String(v));
+});' "$expr" "$@"
+}
+
+# ------------------------------------------------------------ port probing
+
+port_busy() {
+  local p=$1
+  if ss -Htanu 2>/dev/null | awk -v p="$p" '
+      { n = split($4, a, /[:.]/); if (a[n] == p) { f = 1; exit }
+        n = split($5, b, /[:.]/); if (b[n] == p) { f = 1; exit } }
+      END { exit f ? 0 : 1 }'; then return 0; fi
+  local hex
+  hex=$(printf '%04X' "$p")
+  if grep -qiE ":$hex[[:space:]]" /proc/net/tcp /proc/net/tcp6 /proc/net/udp /proc/net/udp6 2>/dev/null; then
+    return 0
+  fi
+  if grep -rqsE -- "--port[= ][\"']?$p([\"' ]|$)" "$UNIT_DIR" 2>/dev/null; then return 0; fi
+  if grep -qE "[[:space:]]${p}/" /etc/services 2>/dev/null; then return 0; fi
+  return 1
+}
+
+baseline_ports() {
+  local unit="$UNIT_DIR/antseed-buyer.service" bport=""
+  [[ -f $unit ]] || return 0
+  bport=$(sed -n 's/.*buyer start --port \([0-9][0-9]*\).*/\1/p' "$unit" | head -1)
+  echo "8379 ${bport:-8377}"
+}
+
+# ------------------------------------------------------------ allocation
+
+# prints "gw buyer"; never reuses anything (registry + state + live + units)
+alloc_ports() {
+  local reserved gw buyer max_tries=$(( PORT_RANGE_HI - PORT_RANGE_LO + 1 ))
+  reserved=$(instance_names | while read -r n; do
+    local f="$STATE_DIR/$n.env"
+    [[ -f $f ]] && ( . "$f"; echo "$GW_PORT"; echo "$BUYER_PORT" )
+  done)
+
+  known_busy() {
+    local p=$1
+    port_in_registry "$p" && return 0
+    grep -qx -- "$p" <<<"$reserved" && return 0
+    local base; base=$(baseline_ports)
+    [[ -n $base ]] && tr ' ' '\n' <<<"$base" | grep -qx -- "$p" && return 0
+    (( p < PORT_RANGE_LO || p > PORT_RANGE_HI )) && return 0
+    port_busy "$p"
+  }
+
+  local seed=$PORT_RANGE_LO
+  {
+    echo "$reserved"
+    cat "$PORT_REGISTRY" 2>/dev/null || true
+    baseline_ports
+  } | tr -s '[:space:]' '\n' | awk 'NF' | sort -n | tail -1 | { read -r last; [[ -n ${last:-} ]] && seed=$(( last + 1 )); }
+
+  (( seed < PORT_RANGE_LO )) && seed=$PORT_RANGE_LO
+  (( seed > PORT_RANGE_HI )) && seed=$PORT_RANGE_LO
+
+  gw=""; buyer=""
+  local p=$seed i
+  for (( i = 0; i < max_tries; i++ )); do
+    if (( p > PORT_RANGE_HI )); then p=$PORT_RANGE_LO; fi
+    if [[ -z $gw ]]; then
+      if ! known_busy "$p"; then gw=$p; fi
+    elif [[ -z $buyer ]]; then
+      if (( p != gw )) && ! known_busy "$p"; then buyer=$p; fi
+    fi
+    [[ -n $gw && -n $buyer ]] && break
+    p=$((p + 1))
+  done
+  [[ -n $gw && -n $buyer ]] || die "no free ports in $PORT_RANGE_LO-$PORT_RANGE_HI"
+  printf '%s %s\n' "$gw" "$buyer"
+}
+
+cf_tunnel_names() {
+  cf GET "/accounts/$ACCOUNT_ID/cfd_tunnel?is_deleted=false&per_page=200" 2>/dev/null |
+    cfj '(j.result||[]).map(t => t.name).join("\n")' || true
+}
+
+alloc_tunnel_name() { # alloc_tunnel_name <instance>
+  local inst=$1 all_tunnels candidate n own_id=""
+  all_tunnels=$(cf_tunnel_names)
+  if [[ -f $(state_file "$inst") ]]; then
+    own_id=$(sed -n 's/^TUNNEL_ID=//p' "$(state_file "$inst")" | head -1)
+  fi
+  candidate="$inst-gateway"; n=2
+  while (:); do
+    local taken=0
+    if [[ -n $own_id ]]; then
+      local owner_name
+      owner_name=$(cf GET "/accounts/$ACCOUNT_ID/cfd_tunnel/$own_id" 2>/dev/null |
+        cfj 'j.result?.name || ""' || true)
+      [[ $owner_name == "$candidate" ]] && { printf '%s' "$candidate"; return 0; }
+    fi
+    grep -qxF -- "$candidate" <<<"$all_tunnels" && taken=1
+    if name_in_registry "$candidate"; then
+      # Strict registry: a name that was ever handed out is taken, UNLESS the
+      # state file of this very instance records it as ours (idempotent rerun).
+      local st="$STATE_DIR/$inst.env"
+      if [[ -f $st ]]; then
+        local rn; rn=$(sed -n 's/^TUNNEL_NAME=//p' "$st" | head -1)
+        [[ $rn == "$candidate" ]] || taken=1
+      else
+        taken=1
+      fi
+    fi
+    (( taken == 0 )) && { printf '%s' "$candidate"; return 0; }
+    candidate="$inst-gateway-$n"; n=$((n + 1))
+    (( n > 9999 )) && die "cannot find a free tunnel name for $inst"
+  done
+}
+
+next_host_num() {
+  local name=$1 max=0 host
+  for host in $(existing_instances | awk '{ print $2 }'); do
+    if [[ $host =~ ^${name}([0-9]+)\. ]]; then
+      (( BASH_REMATCH[1] > max )) && max=${BASH_REMATCH[1]}
+    fi
+  done
+  echo $((max + 1))
+}
+
+# ------------------------------------------------------------ commands
+
+cmd_list() {
+  local names n
+  names=$(instance_names)
+  [[ -n $names ]] || { echo "no instances yet (run: bash install.sh)"; return 0; }
+  printf '%-10s %-28s %-6s %-6s %-10s %-10s %s\n' NAME HOST GW BUYER MEM STATE TUNNEL
+  while read -r n; do
+    [[ -n $n ]] || continue
+    (
+      . "$(state_file "$n")"
+      pid=$(systemctl show -p MainPID --value "$INSTANCE-buyer" 2>/dev/null || echo 0)
+      mem=$(ps -o rss= -p "$pid" 2>/dev/null | awk '{ printf "%d MiB", $1 / 1024 }' || true)
+      [[ -n $mem ]] || mem="-"
+      st=$(systemctl is-active "$INSTANCE-gateway" 2>/dev/null || echo unknown)
+      printf '%-10s %-28s %-6s %-6s %-10s %-10s %s\n' \
+        "$n" "$HOST" "$GW_PORT" "$BUYER_PORT" "$mem" "$st" "${TUNNEL_NAME:-${TUNNEL_ID:0:8}}"
+    )
+  done <<<"$names"
+}
+
+cmd_status() {
+  local names n code
+  if [[ -n ${1:-} ]]; then names=$1; else names=$(instance_names); fi
+  [[ -n $names ]] || { echo "no instances"; return 0; }
+  while read -r n; do
+    [[ -n $n ]] || continue
+    load_instance "$n"
+    echo "${C_BOLD}$n${C_0}  https://$HOST/v1"
+    printf '  %-18s %s\n' gateway "$(systemctl is-active "$n-gateway" 2>/dev/null || true)"
+    printf '  %-18s %s\n' buyer "$(systemctl is-active "$n-buyer" 2>/dev/null || true)"
+    printf '  %-18s %s\n' "ports" "gw=$GW_PORT buyer=$BUYER_PORT"
+    printf '  %-18s %s\n' "tunnel" "${TUNNEL_NAME:-${TUNNEL_ID}}"
+    code=$(curl -sS -m 20 -o /dev/null -w '%{http_code}' "https://$HOST/v1/models" \
+      -H "Authorization: Bearer $API_KEY" 2>/dev/null || echo 000)
+    printf '  %-18s %s\n' "public /v1/models" "$code"
+    if [[ $code != 200 ]]; then
+      code=$(curl -sS -m 20 -o /dev/null -w '%{http_code}' "http://127.0.0.1:$GW_PORT/v1/models" \
+        -H "Authorization: Bearer $API_KEY" 2>/dev/null || echo 000)
+      printf '  %-18s %s\n' "local /v1/models" "$code"
+    fi
+    echo
+  done <<<"$names"
+}
+
+cmd_keys() {
+  local name="" label="admin" a
+  for a in "$@"; do
+    case $a in
+      --label) label="";;
+      *) if [[ -z $name ]]; then name=$a; elif [[ -z $label ]]; then label=$a; fi;;
+    esac
+  done
+  load_instance "$name"
+  as_instance "$USER" "$HOME_DIR" gateway key create --label "${label:-admin}" --json |
+    node -e 'let s=""; process.stdin.on("data", d => s += d).on("end", () => {
+      const j = JSON.parse(s);
+      console.log("API key:", j.apiKey);
+      console.log("id:", j.id, "label:", j.label, "wallet:", j.identityAddress || "-");
+    });'
+}
+
+cmd_link()   { load_instance "${1:-}"; as_instance "$USER" "$HOME_DIR" gateway console-link; }
+cmd_recover(){ load_instance "${1:-}"; as_instance "$USER" "$HOME_DIR" gateway console-link --recover; }
+
+cmd_logs() {
+  local name=${1:-} follow=""
+  [[ -n $name ]] || die "usage: antseed-fleet logs NAME [-f]"
+  [[ ${2:-} == -f ]] && follow=-f
+  load_instance "$name"
+  if [[ -n $follow ]]; then
+    journalctl -u "$name-gateway" -u "$name-buyer" -f
+  else
+    journalctl -u "$name-gateway" -u "$name-buyer" -n 50 --no-pager
+  fi
+}
+
+each_instance() {
+  local action=$1 name=${2:-} names n
+  if [[ -n $name ]]; then names=$name; else names=$(instance_names); fi
+  [[ -n $names ]] || { echo "no instances"; return 0; }
+  while read -r n; do
+    [[ -n $n ]] || continue
+    "$action" "$n"
+  done <<<"$names"
+}
+
+restart_one() { systemctl restart "$1-buyer" "$1-gateway" && ok "$1 restarted"; }
+start_one()   { systemctl start "$1-buyer" "$1-gateway" && ok "$1 started"; }
+stop_one()    { systemctl stop "$1-gateway" "$1-buyer" && ok "$1 stopped"; }
+
+cmd_remove() {
+  local name="" purge=0 a host tunnel wallet home
+  for a in "$@"; do
+    case $a in
+      --keys) purge=1;;
+      -*) die "unknown option $a";;
+      *) name=$a;;
+    esac
+  done
+  load_instance "$name"
+  host=$HOST; tunnel=$TUNNEL_ID; wallet=$WALLET; home=$HOME_DIR
+  systemctl disable --now "$name-gateway" "$name-buyer" 2>/dev/null || true
+  rm -f "$UNIT_DIR/$name-gateway.service" "$UNIT_DIR/$name-buyer.service" "/etc/$name/gateway.env"
+  rmdir "/etc/$name" 2>/dev/null || true
+  systemctl daemon-reload
+  ok "services removed for $name"
+  if (( purge )); then
+    rm -rf "$home"
+    userdel "$name" 2>/dev/null || true
+    ok "data and user deleted (funds in $wallet are lost)"
+  else
+    warn "data kept at $home (wallet $wallet)"
+    warn "delete it later with: antseed-fleet remove $name --keys"
+  fi
+  rm -f "$(state_file "$name")"
+  # NOTE: ports/hosts/tunnel names stay in the strict registries on purpose —
+  # a removed instance must never have its port or name handed to a new one.
+  warn "tunnel $tunnel and DNS $host remain in Cloudflare — delete them in the dashboard if unused"
+  warn "ports $GW_PORT/$BUYER_PORT and host $host stay reserved (strict mode)"
+}
+
+cmd_restore() {
+  local name=${1:-} names n host tunnel port rid
+  [[ -n ${CF_API_TOKEN:-} ]] || die "set CF_API_TOKEN to your Cloudflare token (Tunnel + DNS edit)"
+  command -v node >/dev/null || die "node is required to talk to Cloudflare"
+  if [[ -n $name ]]; then names=$name; else names=$(instance_names); fi
+  [[ -n $names ]] || die "no instances"
+  while read -r n; do
+    [[ -n $n ]] || continue
+    load_instance "$n"
+    host=$HOST; tunnel=$TUNNEL_ID; port=$GW_PORT
+    local zone=${ZONE_ID:-} api=$CF_API
+    local acc
+    acc=$(curl -fsS -m 30 "$api/accounts" -H "Authorization: Bearer $CF_API_TOKEN" |
+      node -e 'let s="";process.stdin.on("data",d=>s+=d).on("end",()=>{const j=JSON.parse(s);process.stdout.write(j.result&&j.result[0]?j.result[0].id:"")})') ||
+      die "cannot list accounts with this token"
+    curl -fsS -m 30 -X PUT "$api/accounts/$acc/cfd_tunnel/$tunnel/configurations" \
+      -H "Authorization: Bearer $CF_API_TOKEN" -H "Content-Type: application/json" \
+      -d "{\"config\":{\"ingress\":[{\"hostname\":\"$host\",\"service\":\"http://localhost:$port\"},{\"service\":\"http_status:404\"}],\"warp-routing\":{\"enabled\":false}}}" >/dev/null ||
+      die "cannot update the tunnel for $n"
+    ok "$n ingress $host -> localhost:$port"
+    rid=$(curl -fsS -m 30 "$api/zones/$zone/dns_records?name=$host" -H "Authorization: Bearer $CF_API_TOKEN" |
+      node -e 'let s="";process.stdin.on("data",d=>s+=d).on("end",()=>{const j=JSON.parse(s);process.stdout.write(j.result&&j.result[0]?j.result[0].id:"")})')
+    [[ -n $rid ]] || die "no DNS record for $host"
+    curl -fsS -m 30 -X PUT "$api/zones/$zone/dns_records/$rid" -H "Authorization: Bearer $CF_API_TOKEN" \
+      -H "Content-Type: application/json" \
+      -d "{\"type\":\"CNAME\",\"name\":\"${host%%.*}\",\"content\":\"$tunnel.cfargotunnel.com\",\"proxied\":true,\"ttl\":1}" >/dev/null ||
+      die "cannot update DNS for $host"
+    ok "$n DNS $host -> ${tunnel:0:8}"
+  done <<<"$names"
+  echo
+  echo "  waiting for cloudflared to pick up the config ..."
+  sleep 8
+  cmd_status "$name"
+}
+
+# ------------------------------------------------------------ check (dry run)
+
+cmd_check() {
+  local name="" domain="" count=1 a
+  for a in "$@"; do
+    case $a in
+      --name) name=$2; shift;;
+      --domain) domain=$2; shift;;
+      --count) count=$2; shift;;
+      *) die "usage: antseed-fleet check --name <prefix> --domain <zone> [--count N]";;
+    esac
+    shift || true
+  done
+  [[ -n $name && -n $domain ]] || die "usage: antseed-fleet check --name <prefix> --domain <zone> [--count N]"
+  [[ $count =~ ^[0-9]+$ ]] && (( count > 0 )) || die "--count must be a positive number"
+
+  registry_touch
+  echo "${C_BOLD}dry run${C_0}  prefix=${C_BOLD}$name${C_0}  domain=${C_BOLD}$domain${C_0}  count=$count"
+  echo
+
+  # zone (optional, needs CF_API_TOKEN)
+  local zone_id="" tunnels=""
+  if [[ -n ${CF_API_TOKEN:-} ]]; then
+    CF_API_TOKEN=$CF_API_TOKEN; 
+    local acc zone
+    zone=$(cf GET "/zones?name=$domain" 2>/dev/null | cfj 'j.result[0]?.id || ""' || true)
+    if [[ -n $zone ]]; then
+      ZONE_ID=$zone; zone_id=$zone
+      acc=$(cf GET /accounts 2>/dev/null | cfj 'j.result[0]?.id || ""' || true)
+      ACCOUNT_ID=$acc
+      [[ -n $acc ]] && tunnels=$(cf_tunnel_names)
+      ok "zone found ($zone), live DNS + tunnel checks enabled"
+    else
+      warn "zone '$domain' not visible with the current token — DNS/tunnel checks skipped"
+    fi
+  else
+    warn "CF_API_TOKEN not set — live DNS/tunnel checks skipped (registry-only)"
+  fi
+  echo
+
+  # next host numbers
+  local n min=1
+  min=$(next_host_num "$name")
+  printf '%-6s %-34s %-16s %-16s %-24s %s\n' "SLOT" "HOST" "GW PORT" "BUYER PORT" "TUNNEL" "CONFLICT"
+  for (( i = 0; i < count; i++ )); do
+    local h nn conflicts="" guard=0
+    nn=$((min + i))
+    while (:); do
+      h=$(printf '%s%d.%s' "$name" "$nn" "$domain")
+      local c=0
+      [[ -n $zone_id ]] && { local r; r=$(cf GET "/zones/$zone_id/dns_records?name=$h" 2>/dev/null | cfj 'j.result[0]?.content || ""' || true); [[ -n $r ]] && c=1; }
+      host_in_registry "$h" && c=1
+      (( c == 0 )) && break
+      nn=$((nn + 1)); guard=$((guard + 1)); (( guard > 1000 )) && { h="<none>"; break; }
+    done
+    local ports gw buyer
+    ports=$(alloc_ports 2>/dev/null) || ports="n/a n/a"
+    gw=${ports%% *}; buyer=${ports##* }
+    local tn="$PREFIX$(( $(next_host_num "x") ))"
+    # tunnel name preview: <instN>-gateway, N from instance index
+    local inst_idx=1
+    while [[ -f $(state_file "${PREFIX}${inst_idx}") ]]; do inst_idx=$((inst_idx + 1)); done
+    tn="${PREFIX}${inst_idx}-gateway"
+    if [[ -n $tunnels ]] && grep -qxF -- "$tn" <<<"$tunnels"; then
+      local k=2; while grep -qxF -- "${tn}-${k}" <<<"$tunnels"; do k=$((k + 1)); done
+      tn="${tn}-${k}"
+    fi
+    name_in_registry "$tn" && conflicts+="tunnel-registry "
+    [[ -n $conflicts ]] || conflicts="—"
+    printf '%-6s %-34s %-16s %-16s %-24s %s\n' "#$((i + 1))" "$h" "$gw" "$buyer" "$tn" "$conflicts"
+    # reserve in a throwaway copy so the next row reflects the next free slot
+    echo "$h" >>"$HOST_REGISTRY.tmp.$$"
+  done
+  rm -f "$HOST_REGISTRY.tmp.$$"
+  echo
+  ok "no collision with existing instances, DNS records or tunnel names"
+  echo "${C_D}  This was a dry run — nothing was created or reserved.${C_0}"
+}
+
+cmd_ports() {
+  registry_touch
+  echo "${C_BOLD}strict port registry${C_0}  ($PORT_REGISTRY)"
+  local total
+  total=$(wc -l <"$PORT_REGISTRY" 2>/dev/null || echo 0)
+  printf '  reserved: %s   range: %s-%s\n\n' "$total" "$PORT_RANGE_LO" "$PORT_RANGE_HI"
+  if [[ -n $(instance_names) ]]; then
+    printf '%-10s %-8s %-8s %-8s %-8s %s\n' NAME GW BUYER GW_LIVE BUYER_LIVE HOST
+    while read -r n; do
+      [[ -n $n ]] || continue
+      ( . "$(state_file "$n")"
+        gwl=$(port_busy "$GW_PORT" && echo yes || echo no)
+        bl=$(port_busy "$BUYER_PORT" && echo yes || echo no)
+        printf '%-10s %-8s %-8s %-8s %-8s %s\n' "$n" "$GW_PORT" "$BUYER_PORT" "$gwl" "$bl" "$HOST" )
+    done <<<"$(instance_names)"
+  else
+    echo "  no instances"
+  fi
+}
+
+cmd_doctor() {
+  local n
+  echo "${C_BOLD}CLI${C_0}"
+  if [[ -x $CLI_BIN ]]; then ok "$CLI_BIN"; else warn "missing $CLI_BIN"; fi
+  echo "${C_BOLD}systemd${C_0}"
+  systemctl is-system-running 2>/dev/null || true
+  echo "${C_BOLD}registries${C_0}"
+  registry_touch
+  printf '  %-12s %s entries\n' ports "$(wc -l <"$PORT_REGISTRY" 2>/dev/null || echo 0)"
+  printf '  %-12s %s entries\n' tunnels "$(wc -l <"$NAME_REGISTRY" 2>/dev/null || echo 0)"
+  printf '  %-12s %s entries\n' hosts "$(wc -l <"$HOST_REGISTRY" 2>/dev/null || echo 0)"
+  echo "${C_BOLD}instances${C_0}"
+  while read -r n; do
+    [[ -n $n ]] || continue
+    load_instance "$n"
+    printf '  %-10s user=%-10s home=%-22s env=%s\n' "$n" "$USER" "$HOME_DIR" \
+      "$([[ -f /etc/$n/gateway.env ]] && echo ok || echo MISSING)"
+    systemctl is-active "$n-buyer" >/dev/null 2>&1 || warn "    $n-buyer not active"
+    systemctl is-active "$n-gateway" >/dev/null 2>&1 || warn "    $n-gateway not active"
+    [[ -d $HOME_DIR ]] || warn "    data dir missing"
+  done <<<"$(instance_names)"
+  echo "${C_BOLD}memory${C_0}"
+  free -m | sed 's/^/  /'
+}
+
+install_script() {
+  local d
+  for d in /opt/antseed-fleet "$(dirname "$(readlink -f "$0")")"; do
+    [[ -f $d/install.sh ]] && { printf '%s' "$d/install.sh"; return 0; }
+  done
+  return 1
+}
+
+cmd_help() {
+  sed -n '2,25p' "$0" | sed 's/^# \{0,1\}//'
+  echo
+  echo "create more instances:"
+  if f=$(install_script); then echo "  sudo bash $f"; else echo "  sudo bash install.sh"; fi
+}
+
+cmd_create() {
+  local f
+  f=$(install_script) || die "install.sh not found (expected /opt/antseed-fleet/install.sh)"
+  exec bash "$f" "$@"
+}
+
+case ${1:-help} in
+  list|ls)   cmd_list ;;
+  status)    shift; cmd_status "$@" ;;
+  keys)      shift; cmd_keys "$@" ;;
+  link)      shift; cmd_link "$@" ;;
+  recover)   shift; cmd_recover "$@" ;;
+  logs)      shift; cmd_logs "$@" ;;
+  restart)   shift; each_instance restart_one "$@" ;;
+  start)     shift; each_instance start_one "$@" ;;
+  stop)      shift; each_instance stop_one "$@" ;;
+  create)    shift; cmd_create "$@" ;;
+  remove|rm) shift; cmd_remove "$@" ;;
+  restore)   shift; cmd_restore "$@" ;;
+  check)     shift; cmd_check "$@" ;;
+  ports)     cmd_ports ;;
+  doctor)    cmd_doctor ;;
+  version|-v|--version) echo "antseed-fleet $VERSION" ;;
+  help|-h|--help|"") cmd_help ;;
+  *) die "unknown command '$1' (see: antseed-fleet help)" ;;
+esac

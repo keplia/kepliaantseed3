@@ -1,0 +1,8 @@
+# Shell scripts must keep LF endings or they break on Linux ("bad interpreter").
+*.sh            text eol=lf
+antseed-fleet   text eol=lf
+get.sh          text eol=lf
+tests/*.sh      text eol=lf
+
+# Everything else normalised to LF in the repo; checked out per-platform.
+*               text=auto
